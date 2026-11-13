@@ -12,11 +12,15 @@
 
 /// 默认数据源（不带结尾斜杠，必须是纯 origin）。用户首次启动就连这里。
 /// 改成你自己的后端，例如 `https://api.your-domain.com`。
-pub const DEFAULT_BASE: &str = "https://hghub.example.com";
+pub const DEFAULT_BASE: &str = "https://xjtu.dmsbazvt.cc";
 
 /// 固定线路列表：显示在「设置 → 线路 → 固定线路」。留空则不显示这一块。
 /// 例如：`&[("我的服务器", "https://api.your-domain.com")]`
-pub const FIXED_LINES: &[(&str, &str)] = &[];
+pub const FIXED_LINES: &[(&str, &str)] = &[
+    ("线路一（西交）", "https://xjtu.dmsbazvt.cc"),
+    ("线路二（中大）", "https://sysu.dmsbazvt.cc"),
+    ("线路三（上交）", "https://sjtu.dmsbazvt.cc"),
+];
 
 /// 地址发布页（自动发现镜像用）。留空 = 关闭镜像发现，界面只显示自定义线路输入框。
 /// 上游原来的发布页是 `https://huangguoai.pages.dev/`，现已失效。
