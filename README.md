@@ -83,6 +83,7 @@ cd server && ADMIN_PASS=你的密码 node src/index.mjs
 - exFAT 等不支持符号链接的文件系统需保留 `.npmrc` 里的 `node-linker=hoisted`
 - 网络安全边界与回归说明见 [docs/security.md](docs/security.md)
 - 改成自己的仓库、自己的后端、自己出包，见 [docs/self-host.md](docs/self-host.md)
+- iOS 上视频为什么必须交给原生播放器（`hg://` 自定义协议的死路），见 [docs/ios-playback.md](docs/ios-playback.md)
 
 ## 许可证
 

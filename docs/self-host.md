@@ -121,7 +121,7 @@ ADMIN_PASS=你的密码 PUBLIC_BASE=https://api.你的域名.com node src/index.
 
 ### 安装
 
-1. 把 `HGhub_1.3.0_ios.ipa` 传到手机（AirDrop / 文件 App / 局域网）
+1. 把 `HGhub_1.3.2_ios.ipa` 传到手机（AirDrop / 文件 App / 局域网）
 2. 打开 **TrollStore** → 右上角 `+` → 选那个 ipa
 3. 等它自己装完，桌面出现 HGhub 图标
 4. 首次打开如果提示「未受信任的开发者」，说明走的不是巨魔安装 —— 回上一步

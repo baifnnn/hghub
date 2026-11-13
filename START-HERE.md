@@ -184,4 +184,5 @@ Actions → iOS → Run workflow
 详细部署、反代配置、接口清单、维护清单，都在：
 
 - `docs/self-host.md` —— 部署与发版全流程
+- `docs/ios-playback.md` —— iOS 播放链路（为什么 `<video>` 不能吃 `hg://`）与排查顺序
 - `server/README.md` —— 后端契约与运维
