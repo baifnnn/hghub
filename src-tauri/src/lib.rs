@@ -1,6 +1,8 @@
 mod api;
 mod config;
 mod lines;
+#[cfg(target_os = "ios")]
+mod ios_viewport;
 mod logging;
 #[cfg(target_os = "macos")]
 mod macos_titlebar;
@@ -65,6 +67,11 @@ pub fn run() {
             // macOS 主窗口在此创建：先按系统红绿灯尺寸算出居中位置（见 macos_titlebar.rs）
             #[cfg(target_os = "macos")]
             macos_titlebar::create_main_window(app)?;
+            // iOS 主窗口由配置自动创建，但冷启动那一帧 WKWebView 尺寸是按安全区算的，
+            // 比屏幕矮了「顶部 + 底部」安全区之和。这里在启动后的几个时间点推一次布局，
+            // 借 tao 的 layoutSubviews 钩子把 frame 校准到 window.bounds（见 ios_viewport.rs）。
+            #[cfg(target_os = "ios")]
+            ios_viewport::install(app);
             Ok(())
         })
         .plugin(
