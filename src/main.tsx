@@ -5,7 +5,9 @@ import { AppProvider } from "./store";
 import { invoke } from "@tauri-apps/api/core";
 import "./index.css";
 import { initPlaybackLog, installPlaybackPageEvents } from "./playbackDiagnostics";
+import { installViewportSync } from "./viewport";
 
+installViewportSync();
 installPlaybackPageEvents();
 void initPlaybackLog();
 

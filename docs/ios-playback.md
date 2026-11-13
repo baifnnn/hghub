@@ -105,3 +105,92 @@ if (useHls && Hls.isSupported()) {
    - 有 `source.load` 且 `engine: "native"`、`native_only: true` → 分支进对了
    - 跟着有 `media.error`（1.3.2 新加的）→ 是解码/网络错误，看 `code`
    - 连 `source.load` 都没有 → `playUrl` 没拿到，回去查 `api_play` 是不是报错
+
+---
+
+# iOS 底部白边：冷启动首帧的 viewport / safe-area 竞态
+
+> 这份是 1.3.3 修的「刚打开时底部一条白边，退到桌面再进一次就正常」。
+
+## 现象
+
+冷启动后首页视频正常播，但底部导航「首页 / 搜索 / 分类 / 我的」下面多出一条白带。切到后台再回来（或杀掉重开一次）就没了。
+
+## 根因
+
+Tauri 在 iOS 上把 WKWebView 挂到 tao 的 root view 上。冷启动时 UIKit 的**第一次 layout 早于安全区和最终 frame 落定**，于是首帧同时踩两个坑：
+
+1. `html { height: 100% }` 量到的 initial containing block 比真实屏幕矮 → 底部空出一条，露出来的是 **WKWebView 自己的原生底色**；
+2. `env(safe-area-inset-bottom)` 返回 `0` → `TabBar` 的 `paddingBottom: var(--sab)` 失效。
+
+切后台再回来，UIKit 会重新 layout 一次，两处都恢复正常 —— 所以「进第二次就好了」。
+
+两个来自框架源码的直接证据：
+
+`tao-0.37.2/src/platform_impl/ios/view.rs:155`
+
+```rust
+// If the app is started in landscape, the view frame and window bounds can be mismatched.
+let view_frame: CGRect = msg_send![object, frame];
+if view_frame != window_bounds { let () = msg_send![object, setFrame: window_bounds]; }
+```
+
+→ view frame 是**事后**被纠正的，首帧必然存在偏差窗口。
+
+`wry-0.57.1/src/wkwebview/mod.rs:489`
+
+```rust
+// Without a background color the webview stays opaque and white, flashing before the page paints,
+// so fall back to the system background to follow the current appearance.
+let color = if let Some((r, g, b, a)) = attributes.background_color { ... } else { UIColor::systemBackgroundColor() };
+```
+
+→ **没配 `backgroundColor` 时底色取 `systemBackgroundColor()`，浅色模式下就是白色**。白边的颜色就是从这里来的。
+
+另外 `tao` 的 iOS 后端里 `set_inner_size` 是空实现（只 `warn!`），`set_background_color` 也是空实现 —— 所以**无法从 Rust 侧修窗口尺寸**，只能在配置层和前端层解决。
+
+## 修法（四层一起上，任一层单独都不够）
+
+### 1. 原生底色：`src-tauri/tauri.conf.json`
+
+```jsonc
+"app": { "windows": [ { ..., "backgroundColor": "#000000" } ] }
+```
+
+这样即使 DOM 一帧都没画，露出来的是黑底而不是白纸。配置链路：`tauri-utils` 的 `WindowConfig.background_color: Option<Color>`（hex 字符串）→ `tauri-runtime-wry` 的 `webview_builder.with_background_color(color.into())` → wry 的 `UIColor::colorWithRed_green_blue_alpha`。
+
+### 2. 首帧 CSS 兜底：`index.html` 内联 `<style>`
+
+CSS bundle 解析前也不能露白，而且 `#root` 自己要有底色（`height` 没撑满时露的是 body，body 又透出 WebView）：
+
+```html
+html, body, #root { background: #1a1a1a; height: 100%; }
+html.theme-light, html.theme-light body, html.theme-light #root { background: #f3f3f3; }
+@supports (height: 100dvh) { html, body, #root { height: 100dvh; } }
+```
+
+### 3. 实测视口高度：新增 `src/viewport.ts`
+
+`installViewportSync()` 做三件事：
+
+- 用 `window.visualViewport.height || innerHeight` 实测高度写进 `--app-h`（`index.css` 里 `html, body, #root` 用 `height: var(--app-h, 100%)` 兜底）；
+- 造一个 0 尺寸探针 div，`padding-top/bottom: env(safe-area-inset-*)`，`getComputedStyle` 读回 px 写进 `--inset-top` / `--inset-bottom`（这是唯一能**在 JS 里读到安全区**的办法）；
+- 在 `0 / 60 / 180 / 480 / 1200 ms` 这几个时间点各对齐一次，并监听 `resize` / `orientationchange` / `visualViewport.resize|scroll` / `visibilitychange`。iOS 上额外轻推两次 reflow，促使 WKWebView 尽快完成 `viewDidLayout`。
+
+`src/main.tsx` 里在 `installPlaybackPageEvents()` 之前调用它。
+
+### 4. 导航内边距取三者最大：`src/App.tsx` 的 `MobileShell`
+
+```tsx
+"--sat": "max(env(safe-area-inset-top), var(--inset-top, 0px), 12px)",
+"--sab": "max(env(safe-area-inset-bottom), var(--inset-bottom, 0px), 16px)",
+```
+
+冷启动时 `env()` 是 0，但 `--inset-*`（实测）和 12/16px 兜底能立刻顶上，导航不会再缺一截内边距。
+
+## 自查
+
+1. `tsc --noEmit` → 0
+2. `vite build` → 0，`dist/index.html` 里能看到 `@supports (height: 100dvh)`
+3. IPA 的 `Info.plist` 旁边（`tauri.conf.json` 编译产物 `Assets.car` 无关）—— 直接看 `tauri.conf.json` 里 `backgroundColor` 是否在，以及二进制里能搜到 `--app-h`
+4. 真机**冷启动**（先杀掉进程）打开，底部不应再露白；再切后台回来对比，两次应完全一致

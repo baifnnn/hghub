@@ -219,7 +219,12 @@ function MobileShell() {
   const { platform } = useStore();
   return (
     <div className={`absolute inset-0 flex flex-col bg-canvas plat-${platform}`}
-      style={{ "--sat": "max(env(safe-area-inset-top), 12px)", "--sab": "max(env(safe-area-inset-bottom), 16px)" } as React.CSSProperties}>
+      style={{
+        /* --inset-* 由 src/viewport.ts 实测写入。冷启动首帧 env() 可能还是 0，
+           两者取 max，避免底部导航缺内边距、露出底色。 */
+        "--sat": "max(env(safe-area-inset-top), var(--inset-top, 0px), 12px)",
+        "--sab": "max(env(safe-area-inset-bottom), var(--inset-bottom, 0px), 16px)",
+      } as React.CSSProperties}>
       <div className="relative flex-1 min-h-0">
         <AppBody />
       </div>

@@ -90,7 +90,12 @@ html.theme-light {
   --color-on-danger: var(--p-on-danger);
 }
 
-html, body, #root { height: 100%; overflow: hidden; overscroll-behavior: none; }
+/* --app-h 由 src/viewport.ts 在首帧与每次视口变化时写入实测高度。
+   iOS 冷启动时 WKWebView 的 initial containing block 会短暂小于真实屏幕，
+   只用 100% 会让底部空出一条（露出来的是原生 WebView 底色）。 */
+html, body { height: 100%; height: var(--app-h, 100%); }
+#root { height: 100%; height: var(--app-h, 100%); background: var(--p-canvas); }
+html, body, #root { overflow: hidden; overscroll-behavior: none; }
 body {
   margin: 0;
   background: var(--p-canvas);

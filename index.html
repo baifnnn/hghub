@@ -12,7 +12,15 @@
         if (localStorage.getItem("hghub_theme") === "light") document.documentElement.classList.add("theme-light");
       } catch (e) {}
     </script>
-    <style>html,body{background:#1a1a1a}html.theme-light,html.theme-light body{background:#f3f3f3}</style>
+    <style>
+      /* 首帧兜底：CSS bundle 还没解析前也不能露白。
+         浅色主题也保留深色底 —— 冷启动那一帧露出来的应该是视频黑底，不是白纸。 */
+      html, body, #root { background: #1a1a1a; height: 100%; }
+      html.theme-light, html.theme-light body, html.theme-light #root { background: #f3f3f3; }
+      @supports (height: 100dvh) {
+        html, body, #root { height: 100dvh; }
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>
