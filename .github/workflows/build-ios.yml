@@ -1,0 +1,128 @@
+name: Build iOS IPA
+
+# 自己维护的构建流水线：
+#   - 手动点 Run workflow，或往 main 推代码、打 v* tag，都会自动出无签名 IPA
+#   - 产物在 Actions 的 Artifacts 里，同时在 Releases 生成/更新 v<版本>-ios
+#   - 不需要 Apple 开发者账号；Team ID 只是 Tauri 生成 Xcode 工程时要一个占位值
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+
+jobs:
+  ios:
+    name: iOS Build (IPA)
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    env:
+      # 无签名构建用不到真正的 Team，这里只满足 Tauri 校验（10 位字母数字）。
+      # 想用自己的可以加一个仓库 Secret: APPLE_DEVELOPMENT_TEAM
+      APPLE_DEVELOPMENT_TEAM: ${{ secrets.APPLE_DEVELOPMENT_TEAM || 'UNSIGNED00' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 对齐版本号与 Team
+        id: ver
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          # 版本号只维护 package.json / tauri.conf.json 两处，这里统一成 tag 或现有值
+          node -e "const fs=require('fs');for(const p of ['src-tauri/tauri.conf.json','package.json']){const j=JSON.parse(fs.readFileSync(p));j.version=process.argv[1];fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')}" "$V"
+          # Team ID 从环境变量写进配置，源码里不写死任何人的 Team
+          node -e "const fs=require('fs');const p='src-tauri/tauri.conf.json';const j=JSON.parse(fs.readFileSync(p));j.bundle=j.bundle||{};j.bundle.iOS=j.bundle.iOS||{};j.bundle.iOS.developmentTeam=process.argv[1];fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')" "$APPLE_DEVELOPMENT_TEAM"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ios-build
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 初始化 iOS Xcode 工程
+        run: |
+          pnpm tauri ios init --ci
+          # 确保 iOS Info.plist（含 ~iphone / ~ipad 变体）支持横竖屏切换及 ATS
+          for plist in $(find src-tauri/gen/apple -name "Info.plist" 2>/dev/null); do
+            for key in "UISupportedInterfaceOrientations" "UISupportedInterfaceOrientations~iphone" "UISupportedInterfaceOrientations~ipad"; do
+              /usr/libexec/PlistBuddy -c "Delete :${key}" "$plist" 2>/dev/null || true
+              /usr/libexec/PlistBuddy -c "Add :${key} array" "$plist"
+              /usr/libexec/PlistBuddy -c "Add :${key}:0 string UIInterfaceOrientationPortrait" "$plist"
+              /usr/libexec/PlistBuddy -c "Add :${key}:1 string UIInterfaceOrientationLandscapeLeft" "$plist"
+              /usr/libexec/PlistBuddy -c "Add :${key}:2 string UIInterfaceOrientationLandscapeRight" "$plist"
+            done
+            # 自建/镜像后端可能走 http，放开 ATS；不收任何用户数据，风险可控
+            /usr/libexec/PlistBuddy -c "Delete :NSAppTransportSecurity" "$plist" 2>/dev/null || true
+            /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" "$plist"
+            /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" "$plist"
+          done
+
+      - name: 构建 iOS 应用与打包 IPA
+        shell: bash
+        env:
+          APP_VERSION: ${{ steps.ver.outputs.version }}
+        run: bash scripts/build-ios-unsigned.sh "$APP_VERSION"
+
+      - name: 上传 IPA 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-iOS-IPA
+          path: artifacts/*
+          if-no-files-found: error
+
+      - name: 发布 iOS GitHub Release
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          TAG="v${V}-ios"
+          NOTES="## HGhub iOS 版 (v${V})
+
+          ### 这是什么
+          原项目已停止维护、上游数据接口下线。此处是**自行维护的构建**：客户端保留原有界面与播放能力，
+          数据源地址不再写死，可在「设置 → 线路 → 自定义线路」里换成你自己部署的后端（仓库里的 server/ 可以直接跑）。
+
+          ### ✨ 客户端特性
+          - **沉浸式竖屏刷剧流**：首页推荐流、题材分类、三大榜单（热门/推荐/潜力）、搜索、图文与视频帖、选集与历史续播。
+          - **原生横竖屏切换**：横屏视频一键「横屏全屏」（调用 iOS 原生屏幕方向旋转），物理横置自动全屏、竖回自动退出。
+          - **触控手势**：双指缩放平移（1x~4x）、单击清屏、双击暂停、长按 2.0x 倍速 + 上滑锁定、左右横滑预览定位。
+          - **HLS 播放加固**：AES Key 与分片内存缓存、拖动进度条自愈重连、全屏旋转过渡期保活、片尾自动连播。
+          - **线路管理**：支持手动填写自定义后端地址、固定线路与镜像线路探测。
+
+          ### 📲 安装（免证书生产包 \`.ipa\`）
+          1. **TrollStore（巨魔商店）**：下载 \`HGhub_${V}_ios.ipa\` 直接导入巨魔永久安装。
+          2. **AltStore / SideStore / Sideloadly**：使用个人 Apple ID 自签安装。
+          3. **轻松签（ESign）/ 牛蛙助手 / Feather / 全能签**：导入证书签名后直接安装。"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/*.ipa --clobber
+            gh release edit "$TAG" --title "HGhub v${V} iOS 正式版" --notes "$NOTES" --prerelease=false --latest
+          else
+            gh release create "$TAG" artifacts/*.ipa \
+              --title "HGhub v${V} iOS 正式版" \
+              --notes "$NOTES" \
+              --latest
+          fi

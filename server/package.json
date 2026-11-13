@@ -1,0 +1,12 @@
+{
+  "name": "hghub-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "HGhub 自建后端：把本地/自己的视频目录变成客户端能直接浏览的数据源",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "scan": "node src/scan.mjs"
+  }
+}

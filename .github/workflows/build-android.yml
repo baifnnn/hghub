@@ -1,0 +1,311 @@
+name: Build Android APK
+
+# 只出 APK 产物的构建入口，与 release.yml 里的 Android job 互相独立。
+#
+# 为什么单独一个文件：
+#   release.yml 的 android job 绑在 `push: tags v*` 上，且缺签名 secret 时直接 exit 1，
+#   想验证「改动之后还能不能编出包」就得打 tag、还会污染 Release。
+#   这里做成纯手动触发、无签名也能跑通并产出可安装的 APK。
+#
+# 签名策略（见「签名 APK」步骤）：
+#   1. 配了 4 个 ANDROID_* secret → 用正式 keystore 签名（可覆盖升级、可上架）。
+#   2. 没配 → 现场生成一个临时 keystore 自签名，包能装，但每次运行签名都不同，
+#      不能覆盖升级；临时 keystore 会作为 artifact 上传，可转成 secret 复用。
+#   3. profile=debug → 直接用 Gradle 的 debug 签名，仅用于调试验证。
+#
+# 触发：Actions 页面手动 Run workflow；打 v* tag 时也会跑（但不自动发 Release）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "构建类型：release 出可安装包，debug 出调试包"
+        type: choice
+        options: [release, debug]
+        default: release
+      version:
+        description: "覆盖版本号（留空则读 tauri.conf.json）"
+        type: string
+        required: false
+        default: ""
+      publish_release:
+        description: "构建完成后发布到 GitHub Release（需要 tag 或手动指定版本）"
+        type: boolean
+        default: false
+  push:
+    tags: ["v*"]
+
+# 同一分支/标签只保留最新一次运行，避免重复排队。
+concurrency:
+  group: android-${{ github.ref }}-${{ inputs.profile || 'release' }}
+  cancel-in-progress: true
+
+env:
+  CI: "true"
+  # 固定 runner 版本：ubuntu-latest 迟早会漂到 26.04，预装的 SDK/NDK 组合随之变化，
+  # 上游 v1.2.0 是在 ubuntu-24.04 上验证通过的，这里钉死避免突然失败。
+  ANDROID_NDK_VERSION: "28.2.13676358"
+  ANDROID_PLATFORM: "android-36"
+  ANDROID_BUILD_TOOLS: "36.0.0"
+
+jobs:
+  android:
+    name: Android APK (${{ inputs.profile || 'release' }})
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解析版本号
+        id: ver
+        shell: bash
+        # inputs.version 走 env 而不是直接内插进脚本：手动输入的字符串若含
+        # $(...) / 反引号 会被 shell 执行，等于给 workflow 开了个注入口。
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          elif [[ -n "${INPUT_VERSION:-}" ]]; then
+            V="$INPUT_VERSION"
+          else
+            V="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          fi
+          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::版本号格式非法：$V（需要 semver，如 1.2.1）"; exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          node -e "const fs=require('fs');for(const p of ['src-tauri/tauri.conf.json','package.json']){const j=JSON.parse(fs.readFileSync(p));j.version=process.argv[1];fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')}" "$V"
+          echo "构建版本：$V"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 准备 Android SDK / NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          if [ ! -d "$SDK" ]; then
+            echo "::error::找不到 Android SDK（$SDK），runner 镜像可能变了"; exit 1
+          fi
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+          # runner 上 cmdline-tools 的目录名各版本不一，逐个探测。
+          SDKM=""
+          for c in "$SDK/cmdline-tools/latest/bin/sdkmanager" "$SDK/cmdline-tools/bin/sdkmanager" "$SDK/tools/bin/sdkmanager"; do
+            [ -x "$c" ] && { SDKM="$c"; break; }
+          done
+          if [ -z "$SDKM" ]; then
+            # 兜底：装一份 cmdline-tools（runner 镜像缺失时才会走到）
+            echo "未找到 sdkmanager，安装 cmdline-tools"
+            curl -fsSL -o /tmp/cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            mkdir -p "$SDK/cmdline-tools"
+            unzip -q /tmp/cmdtools.zip -d "$SDK/cmdline-tools"
+            mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
+            SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          fi
+
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+
+          # NDK 体积约 1GB，runner 上若已有同版本就跳过，省 2 分钟。
+          PKGS=("platform-tools" "platforms;$ANDROID_PLATFORM" "build-tools;$ANDROID_BUILD_TOOLS")
+          if [ -d "$SDK/ndk/$ANDROID_NDK_VERSION" ]; then
+            echo "NDK $ANDROID_NDK_VERSION 已存在，跳过安装"
+          else
+            PKGS+=("ndk;$ANDROID_NDK_VERSION")
+          fi
+          "$SDKM" --install "${PKGS[@]}"
+
+          if [ ! -d "$SDK/ndk/$ANDROID_NDK_VERSION" ]; then
+            echo "::error::NDK $ANDROID_NDK_VERSION 安装后仍不存在"; ls "$SDK/ndk" || true; exit 1
+          fi
+          echo "NDK_HOME=$SDK/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+          ls "$SDK/ndk"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          # key 里带上 profile，release（lto=true, opt-level=s）与 debug 产物不共用缓存。
+          key: android-${{ inputs.profile || 'release' }}
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      # beforeBuildCommand 会跑 pnpm build 与 sync-android-icons.mjs，
+      # 但 sync 脚本要求 gen/android 已存在，所以 init 必须在 build 之前。
+      - name: 生成 Android 工程
+        run: pnpm tauri android init --ci
+
+      - name: 编译 APK（按 ABI 分包）
+        shell: bash
+        env:
+          PROFILE: ${{ inputs.profile || 'release' }}
+        run: |
+          set -euo pipefail
+          ARGS=(--apk --split-per-abi --target aarch64 armv7 x86_64)
+          if [ "$PROFILE" = "debug" ]; then
+            ARGS+=(--debug)
+          fi
+          echo "执行：pnpm tauri android build ${ARGS[*]}"
+          pnpm tauri android build "${ARGS[@]}"
+
+      - name: 收集并签名 APK
+        shell: bash
+        env:
+          PROFILE: ${{ inputs.profile || 'release' }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BT/apksigner"
+
+          # 统一找产物：release 是 app-<abi>-release-unsigned.apk，debug 是 app-<abi>-debug.apk
+          mapfile -t APKS < <(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | sort)
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo "::error::没有找到任何 APK 产物"; exit 1
+          fi
+          printf '找到 %d 个 APK：\n' "${#APKS[@]}"; printf '  %s\n' "${APKS[@]}"
+
+          # 三种签名路径的判定
+          MODE=""
+          KS=""
+          if [ "$PROFILE" = "debug" ]; then
+            MODE="debug"
+          elif [ -n "${KEYSTORE_BASE64:-}" ]; then
+            for v in KEY_ALIAS STORE_PASSWORD KEY_PASSWORD; do
+              if [ -z "${!v:-}" ]; then
+                echo "::error::已配置 ANDROID_KEY_BASE64，但缺少 secret $v"; exit 1
+              fi
+            done
+            MODE="release"
+          else
+            MODE="adhoc"
+          fi
+          echo "签名模式：$MODE"
+
+          if [ "$MODE" = "release" ]; then
+            KS="$RUNNER_TEMP/release.keystore"
+            echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
+          elif [ "$MODE" = "adhoc" ]; then
+            # 临时自签名：能装机，但签名指纹每次都变，无法覆盖升级。
+            KS="$RUNNER_TEMP/adhoc.keystore"
+            keytool -genkeypair -v -keystore "$KS" -alias hghub -keyalg RSA -keysize 2048 \
+              -validity 10000 -storepass hghub-ci -keypass hghub-ci \
+              -dname "CN=HGhub CI Adhoc, O=HGhub, C=CN" > /dev/null 2>&1
+            KEY_ALIAS="hghub"; STORE_PASSWORD="hghub-ci"; KEY_PASSWORD="hghub-ci"
+            cp "$KS" "artifacts/adhoc-keystore.jks"
+          fi
+
+          found=0
+          for f in "${APKS[@]}"; do
+            # .../apk/<abi>/<debug|release>/app-....apk  → 取 <abi>
+            abi="$(basename "$(dirname "$(dirname "$f")")")"
+            if [ "$MODE" = "debug" ]; then
+              # Gradle 已用 debug keystore 签好，直接改名。
+              # 文件名带 -debug：两种包体积、签名都不同，同名字太容易装错。
+              out="artifacts/HGhub_${VERSION}_${abi}-debug.apk"
+              cp "$f" "$out"
+            else
+              out="artifacts/HGhub_${VERSION}_${abi}.apk"
+              # --v4-signing-enabled false：否则 apksigner 会额外要 idsig，部分安装器不认
+              "$APKSIGNER" sign --ks "$KS" --ks-key-alias "$KEY_ALIAS" \
+                --ks-pass "pass:$STORE_PASSWORD" --key-pass "pass:$KEY_PASSWORD" \
+                --v4-signing-enabled false --out "$out" "$f"
+            fi
+            # 先落文件再截取：直接 `apksigner verify | head -3` 会因 SIGPIPE 被判失败（pipefail）。
+            "$APKSIGNER" verify --print-certs "$out" > "$RUNNER_TEMP/verify.txt" 2>&1
+            sed -n '1,3p' "$RUNNER_TEMP/verify.txt"
+            found=$((found+1))
+          done
+
+          rm -f "$KS"
+          if [ "$found" -eq 0 ]; then echo "::error::签名后没有产出任何 APK"; exit 1; fi
+          ls -lh artifacts
+
+          # 把签名模式传给后续步骤（写进 summary 与 Release 说明）
+          echo "SIGN_MODE=$MODE" >> "$GITHUB_ENV"
+
+      - name: 写构建摘要
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## HGhub Android v$VERSION"
+            echo
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 触发 | \`$GITHUB_EVENT_NAME\` |"
+            echo "| 提交 | \`${GITHUB_SHA:0:8}\` |"
+            echo "| 签名模式 | $SIGN_MODE |"
+            echo
+            echo "### 产物"
+            ls -1 artifacts | sed 's/^/- `/; s/$/`/'
+            echo
+            case "$SIGN_MODE" in
+              release) echo "> 已用仓库 secrets 中的正式 keystore 签名，可覆盖升级。" ;;
+              debug)   echo "> debug 签名，仅供安装调试，不要分发。" ;;
+              adhoc)
+                echo "> ⚠️ **临时自签名**：包能装，但签名指纹每次运行都不同，"
+                echo "> 装了新包必须先卸载旧包。想稳定升级，请把 \`adhoc-keystore.jks\` 下载下来，"
+                echo "> 转成 4 个 secret（ANDROID_KEY_BASE64 / ANDROID_KEY_ALIAS /"
+                echo "> ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_PASSWORD）。"
+                echo "> 其中临时密码是 \`hghub-ci\`、别名 \`hghub\`。"
+                ;;
+            esac
+            echo
+            echo "### 安装"
+            echo "按手机 CPU 架构选择：真机几乎都是 \`arm64\`；老设备（2016 年前）用 \`arm\`；"
+            echo "\`x86_64\` 只用于模拟器。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 发布 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          # 独立用 v<版本>-android 这个 tag，避免和 release.yml 的 v* Release 抢同一个条目。
+          TAG="v${VERSION}-android"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/*.apk --clobber
+          else
+            NOTE="HGhub v${VERSION} Android APK（签名模式：${SIGN_MODE}）。安装前按 CPU 架构选择对应包，真机通常用 arm64。"
+            gh release create "$TAG" artifacts/*.apk \
+              --title "HGhub v${VERSION} Android" \
+              --notes "$NOTE"
+          fi
