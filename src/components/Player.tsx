@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import Hls from "hls.js";
-import { fmtTime, platform, playlist } from "../api";
+import { fmtTime, nativeMedia, platform, playlist } from "../api";
 import { mediaResource, observeHls, usePlayerDiagnostics } from "../playbackDiagnostics";
 import { usePlaybackActivity } from "../usePlaybackActivity";
 import { useSeekInput } from "../useSeekInput";
@@ -60,14 +60,16 @@ export default function Player({
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !src) return;
-    const url = playlist(src);
+    // iOS：AVPlayer 不解析 hg:// 自定义协议，直接给上游 https 地址（详见 VideoSurface 注释）
+    const nativeOnly = platform === "ios";
+    const url = nativeOnly ? nativeMedia(src) : playlist(src);
     recoverCountRef.current = 0;
     setErrMsg("");
-    trace("source.load", { engine: Hls.isSupported() ? "hls.js" : "native", auto_play: autoPlay });
+    trace("source.load", { engine: nativeOnly ? "native" : Hls.isSupported() ? "hls.js" : "native", native_only: nativeOnly, auto_play: autoPlay });
 
     if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
 
-    if (Hls.isSupported()) {
+    if (!nativeOnly && Hls.isSupported()) {
       const hls = new Hls({
         // 禁用从插播/内容引导 JSON 派生直连 URL 的可选功能。
         interstitialsController: undefined,

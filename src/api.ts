@@ -266,6 +266,28 @@ export function directMedia(url: string): string {
   return `${LOCAL}/seg?u=${encodeURIComponent(url)}`;
 }
 
+/**
+ * 取回「直连地址」：把 hg://localhost/xxx?u=... 这类代理 URL 还原成上游 https 地址。
+ *
+ * 用途：iOS WKWebView 的 <video> 走 AVPlayer，AVPlayer 无法解析 WKURLSchemeHandler
+ * 注册的自定义协议（hg://），会一直停在加载态。设备没有 MediaSource / ManagedMediaSource
+ * 时（iOS < 17.1）hls.js 不可用，只能交给原生播放器，此时必须喂真实 https 地址。
+ */
+export function nativeMedia(url: string): string {
+  if (!url) return "";
+  if (isLocalMedia(url)) {
+    const i = url.indexOf("?u=");
+    if (i >= 0) {
+      try {
+        return decodeURIComponent(url.slice(i + 3));
+      } catch {
+        return url;
+      }
+    }
+  }
+  return url;
+}
+
 /** 按扩展名选择代理方式：m3u8 → 播放列表改写；其它 → 原样透传 */
 export function mediaUrl(url: string): string {
   return /\.m3u8(\?|$)/i.test(url) ? playlist(url) : directMedia(url);

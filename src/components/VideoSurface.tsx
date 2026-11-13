@@ -1,6 +1,6 @@
 import React, { useEffect, useImperativeHandle, useRef, forwardRef, useState } from "react";
 import Hls from "hls.js";
-import { isLocalMedia, platform, playlist } from "../api";
+import { isLocalMedia, nativeMedia, platform, playlist } from "../api";
 import { mediaResource, observeHls, usePlayerDiagnostics } from "../playbackDiagnostics";
 import { usePlaybackActivity } from "../usePlaybackActivity";
 
@@ -166,9 +166,19 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
 
     const proxied = isLocalMedia(src);
     const url = proxied ? src : playlist(src);
-    const useHls = !url.includes("/seg?u=");
     const isIos = platform === "ios";
-    trace("source.load", { engine: useHls && Hls.isSupported() ? "hls.js" : "native", auto_play: autoPlay, resource: mediaResource(src) });
+    // iOS 的 <video> 由 AVPlayer 驱动，它不走 WKURLSchemeHandler，解析不了 hg:// 自定义协议，
+    // 会永久卡在加载态（iOS < 17.1 更是连 ManagedMediaSource 都没有，hls.js 直接不可用）。
+    // 因此 iOS 一律交给原生播放器 + 真实 https 地址；其它平台继续走 hg:// 代理。
+    const nativeOnly = isIos;
+    const playSrc = nativeOnly ? nativeMedia(url) : url;
+    const useHls = !nativeOnly && !url.includes("/seg?u=");
+    trace("source.load", {
+      engine: useHls && Hls.isSupported() ? "hls.js" : "native",
+      auto_play: autoPlay,
+      native_only: nativeOnly,
+      resource: mediaResource(src),
+    });
 
     /* 换源时先把音量/倍速套回去：hls 重新 attach 后浏览器会把它们重置成默认值 */
     const applySettings = () => {
@@ -275,7 +285,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
         }
       });
     } else {
-      video.src = url;
+      video.src = playSrc;
       if (autoPlay) activity.play("native_autoplay", true);
     }
 
@@ -388,6 +398,14 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
           if (activity.isActive()) onPlaying?.();
         }}
         onSeeking={() => onWaiting?.()}
+        onError={(e) => {
+          const v = e.target as HTMLVideoElement;
+          const err = v.error;
+          if (!err) return;
+          trace("media.error", { code: err.code, message: String(err.message || "").slice(0, 120) });
+          // 原生分支（iOS）没有 hls.js 的错误通道，这里补上，避免一直转圈没有任何提示
+          if (!hlsRef.current) onError?.(`播放失败（错误码 ${err.code}）`);
+        }}
         onSeeked={() => {
           const v = videoRef.current;
           if (v && !v.paused && activity.isActive()) onPlaying?.();
