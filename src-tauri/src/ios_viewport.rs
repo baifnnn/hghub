@@ -154,14 +154,6 @@ unsafe fn send_insets_ret(obj: Id, name: &[u8]) -> UIEdgeInsets {
     f(obj, sel(name))
 }
 
-unsafe fn send_insets(obj: Id, name: &[u8], insets: UIEdgeInsets) {
-    if obj.is_null() {
-        return;
-    }
-    let f: extern "C" fn(Id, Sel, UIEdgeInsets) = std::mem::transmute(objc_msgSend as *const ());
-    f(obj, sel(name), insets);
-}
-
 // ---------------------------------------------------------------------------
 // 具体动作
 // ---------------------------------------------------------------------------
@@ -254,11 +246,12 @@ pub fn install(app: &tauri::App) {
             if at > elapsed {
                 std::thread::sleep(Duration::from_millis(at - elapsed));
             }
-            let at = start.elapsed().as_millis() as u64;
+            let stamp = start.elapsed().as_millis() as u64;
             let Some(window) = handle.get_webview_window("main") else {
                 continue;
             };
-            let _ = window.with_webview(|webview| {
+            // 闭包被投递到主线程执行，生命周期超过本轮循环，所以必须 move。
+            let _ = window.with_webview(move |webview| {
                 let raw = webview.inner() as Id;
                 if raw.is_null() {
                     return;
@@ -267,7 +260,7 @@ pub fn install(app: &tauri::App) {
                 playback_log::record(
                     "ios.viewport.nudge",
                     serde_json::json!({
-                        "at_ms": at,
+                        "at_ms": stamp,
                         "window": [target.width, target.height],
                         "root_before": [root_before.width, root_before.height],
                         "webview_after": [after.width, after.height],
